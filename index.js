@@ -1,5 +1,7 @@
+'use strict';
+
 var mongoose = require('mongoose'),
-    owl = require('owl-deepcopy');
+    _ = require('lodash');
 
 var Schema = mongoose.Schema,
     Model = mongoose.Model;
@@ -8,23 +10,74 @@ var Schema = mongoose.Schema,
  * Add a new function to the schema prototype to create a new schema by extending an existing one
  */
 Schema.prototype.extend = function(obj, options) {
-  
   // Deep clone the existing schema so we can add without changing it
-  var newSchema = owl.deepCopy(this);
+  var newSchema = _.cloneDeep(this);
 
-  // Fix for callQueue arguments, todo: fix clone implementation
-  newSchema.callQueue.forEach(function(k) {
-    var args = [];
-    for(var i in k[1]) {
-      args.push(k[1][i]);
+  newSchema._callQueue = [];
+
+  var that = this;
+
+  newSchema.callQueue = new Proxy(newSchema._callQueue, {
+    get: function(target, property, receiver) {
+      switch (property) {
+      case 'length':
+        return target.length + that.callQueue.length;
+      case 'toJSON':
+        return () => target.concat(that.callQueue);
+      case 'push':
+        return (e) => target.push(e);
+      case 'reduce':
+        return Array.prototype.reduce.bind(target.concat(that.callQueue));
+      case 'unshift':
+        return (e) => target.unshift(e);
+      default:
+        if (typeof property !== 'symbol' && isNaN(property)) {
+          return target[property];
+        } else {
+          return that.callQueue.concat(target)[property];
+        }
+      }
     }
-    k[1] = args;
   });
+
+  // Fix validators RegExps
+  Object.keys(this.paths).forEach(function(k) {
+    this.paths[k].validators.forEach(function (validator, index) {
+        if (validator.validator instanceof RegExp) {
+          newSchema.paths[k].validators[index].validator = validator.validator;
+        }
+        if (validator.regexp instanceof RegExp) {
+          newSchema.paths[k].validators[index].regexp = validator.regexp;
+        }
+    });
+  }, this);
 
   // Override the existing options with any newly supplied ones
   for(var k in options) {
     newSchema.options[k] = options[k];
   }
+
+  // Change the unique fields to compound discriminator/field unique indexes
+  // using a 2dSphere [HACK ALERT] to allow duplicates or missing fields on subSchemas where
+  // the option has not been specified
+  var uniqueFields = [];
+
+  for(var k in obj) {
+    if(obj[k].unique) {
+      obj[k].unique = false;
+      uniqueFields.push(k);
+    }
+  }
+
+  uniqueFields.forEach(function (field) {
+    obj[field + '_unique'] = { type: {type: String, enum: "Point", default: "Point"}, coordinates: { type: [Number], default: [0,0] } };
+
+    var index = {};
+    index[newSchema.options.discriminatorKey] = 1;
+    index[field] = 1;
+    index[field + '_unique'] = '2dsphere';
+    newSchema.index(index, { unique: true });
+  });
 
   // This adds all the new schema fields
   newSchema.add(obj);
@@ -52,28 +105,30 @@ Schema.prototype.extend = function(obj, options) {
 /**
  * Wrap the model init to set the prototype based on the discriminator field
  */
-var oldInit = Model.prototype.init;
+var _init = Model.prototype.init;
 Model.prototype.init = function(doc, query, fn) {
   var key = this.schema.options['discriminatorKey'];
   if(key) {
-    var newFn = function() {
-      // this is pretty ugly, but we need to run the code below before the callback
-      process.nextTick(function() {
-        fn.apply(this, arguments);
-      });
-    }
-    var obj = oldInit.call(this, doc, query, newFn);
 
     // If the discriminatorField contains a model name, we set the documents prototype to that model
     var type = doc[key];
-    var model = mongoose.models[type];
-    if(model) {
+    if(type) {
+      // this will throw exception if the model isn't registered
+      var model = this.db.model(type);
+      var newFn = function() {
+        // this is pretty ugly, but we need to run the code below before the callback
+        process.nextTick(function() {
+          if(fn && typeof fn === 'function') fn.apply(this, arguments);
+        });
+      }
+      var modelInstance = new model();
+      this.schema = model.schema;
+      var obj = _init.call(this, doc, query, newFn);
       obj.__proto__ = model.prototype;
+      return obj;
     }
-
-    return obj;
-  } else {
-    // If theres no discriminatorKey we can just call the original method
-    return oldInit.apply(this, arguments);
   }
+
+  // If theres no discriminatorKey we can just call the original method
+  return _init.apply(this, arguments);
 }
